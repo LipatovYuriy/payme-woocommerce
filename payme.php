@@ -3,7 +3,7 @@
 Plugin Name: Payme
 Plugin URI:  http://paycom.uz
 Description: Payme Checkout Plugin for WooCommerce
-Version: 1.5.1
+Version: 1.5.2
 Author: richman@mail.ru, support@paycom.uz
 Text Domain: payme
 Requires PHP: 7.4
@@ -173,55 +173,86 @@ function woocommerce_payme()
             return (int) round(((float) $amount) * 100);
         }
 
-        public function generate_form($order_id)
+        /**
+         * Builds the direct Payme "quick link" (GET method) checkout URL:
+         * https://checkout.paycom.uz/base64(m=...;ac.order_id=...;a=...;c=...;l=...)
+         * Returning this straight from process_payment()/receipt_page() sends
+         * the customer to Payme in one hop, with no intermediate WooCommerce
+         * "Pay for order" page - matching how the click.uz gateway does it.
+         *
+         * @see https://developer.help.paycom.uz/initsializatsiya-platezhey/otpravka-cheka-po-metodu-get/
+         */
+        private function build_payme_checkout_url(WC_Order $order)
         {
-            $order = wc_get_order($order_id);
-            if (!$order) {
-                return '';
-            }
-
             $sum = $this->to_tiyin($order->get_total());
-            $description = sprintf(__('Payment for Order #%1$s', 'payme'), $order_id);
 
             $lang_codes = ['ru_RU' => 'ru', 'en_US' => 'en', 'uz_UZ' => 'uz'];
             $lang = isset($lang_codes[get_locale()]) ? $lang_codes[get_locale()] : 'en';
 
-            $label_pay = __('Pay', 'payme');
-            $label_cancel = __('Cancel payment and return back', 'payme');
-            $callback_url = trailingslashit($this->return_url) . $order_id . '/?key=' . $order->get_order_key();
+            // Params are delimited with ';' - the callback URL itself must
+            // therefore never contain a literal ';' (a normal WP query string doesn't).
+            $params = sprintf(
+                'm=%s;ac.order_id=%s;a=%d;c=%s;l=%s',
+                $this->merchant_id,
+                $order->get_id(),
+                $sum,
+                $this->get_return_url($order),
+                $lang
+            );
 
-            $form = '<form action="' . esc_url($this->checkout_url) . '" method="POST" id="payme_form">'
-                . '<input type="hidden" name="account[order_id]" value="' . esc_attr($order_id) . '">'
-                . '<input type="hidden" name="amount" value="' . esc_attr($sum) . '">'
-                . '<input type="hidden" name="merchant" value="' . esc_attr($this->merchant_id) . '">'
-                . '<input type="hidden" name="callback" value="' . esc_attr($callback_url) . '">'
-                . '<input type="hidden" name="lang" value="' . esc_attr($lang) . '">'
-                . '<input type="hidden" name="description" value="' . esc_attr($description) . '">'
-                . '<input type="submit" class="button alt" id="submit_payme_form" value="' . esc_attr($label_pay) . '">'
-                . '<a class="button cancel" href="' . esc_url($order->get_cancel_order_url()) . '">' . esc_html($label_cancel) . '</a>'
-                . '</form>';
+            return trailingslashit($this->checkout_url) . base64_encode($params);
+        }
 
-            return $form;
+        /**
+         * The URL Payme redirects the customer's browser back to after payment
+         * or cancellation. Built with add_query_arg() (not string concatenation)
+         * so order_id/key are always well-formed, separate query parameters -
+         * concatenating them onto a return_url that already has its own "?...”
+         * query string (the default is site_url('/cart/?payme_success=1'))
+         * used to produce a URL with two '?' characters, which made order_id
+         * and key unrecoverable on the receiving end.
+         */
+        private function get_return_url(WC_Order $order)
+        {
+            return add_query_arg(
+                [
+                    'order_id' => $order->get_id(),
+                    'key' => $order->get_order_key(),
+                ],
+                $this->return_url
+            );
         }
 
         public function process_payment($order_id)
         {
             $order = wc_get_order($order_id);
 
+            if (!$order) {
+                wc_add_notice(__('Order not found.', 'payme'), 'error');
+                return ['result' => 'failure'];
+            }
+
             return [
                 'result' => 'success',
-                'redirect' => add_query_arg(
-                    'order_pay',
-                    $order->get_id(),
-                    add_query_arg('key', $order->get_order_key(), $order->get_checkout_payment_url(true))
-                )
+                'redirect' => $this->build_payme_checkout_url($order)
             ];
         }
 
+        /**
+         * Handles the "Pay for order" retry entry point (My Account > Orders > Pay).
+         * Redirects straight to Payme instead of rendering an intermediate page,
+         * for the same reason and in the same way as process_payment() above.
+         */
         public function receipt_page($order_id)
         {
-            echo '<p>' . esc_html__('Thank you for your order, press "Pay" button to continue.', 'payme') . '</p>';
-            echo $this->generate_form($order_id);
+            $order = wc_get_order($order_id);
+
+            if (!$order) {
+                return;
+            }
+
+            wp_redirect($this->build_payme_checkout_url($order));
+            exit;
         }
 
         /**
@@ -956,6 +987,14 @@ function payme_success_query_vars($query_vars)
  * the same request - including widgets and menus - not just the payment
  * status message), and to verify the order key before showing payment status,
  * since this endpoint previously trusted a plain numeric order_id from the URL.
+ *
+ * Fixed in 1.5.2: order_id/key are now read from a properly built query
+ * string (see get_return_url()) instead of being naively concatenated onto
+ * a return_url that already had its own "?payme_success=1" query string -
+ * that used to produce a URL with two '?' characters, so order_id and key
+ * were never actually recoverable here. The static "payme_success=1" marker
+ * never varied with the real outcome anyway, so it's dropped in favour of
+ * checking the order's real status, which is what actually reflects payment.
  */
 add_action('parse_request', 'payme_success_parse_request');
 function payme_success_parse_request(&$wp)
@@ -968,7 +1007,7 @@ function payme_success_parse_request(&$wp)
         return;
     }
 
-    $order_id = isset($wp->query_vars['order_id']) ? absint($wp->query_vars['order_id']) : 0;
+    $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
     $order = $order_id ? wc_get_order($order_id) : false;
 
     $submitted_key = isset($_GET['key']) ? sanitize_text_field(wp_unslash($_GET['key'])) : '';
@@ -979,19 +1018,17 @@ function payme_success_parse_request(&$wp)
         exit;
     }
 
-    $paid = isset($wp->query_vars['payme_success']) && (string) $wp->query_vars['payme_success'] === '1';
-
-    if (!$paid) {
-        wc_add_notice(__('An error occurred during payment. Try again or contact your administrator.', 'payme'), 'error');
-        wp_safe_redirect($order->get_cancel_order_url());
-        exit;
-    }
-
     if (in_array($order->get_status(), ['pending', 'on-hold'], true)) {
         // Payme's own PerformTransaction callback has not landed yet (or was
         // rejected); do not claim success until payment has actually been
         // confirmed server-to-server. 'on-hold' = transaction opened, not yet performed.
         wp_safe_redirect($order->get_cancel_order_url());
+        exit;
+    }
+
+    if (in_array($order->get_status(), ['cancelled', 'refunded', 'failed'], true)) {
+        wc_add_notice(__('An error occurred during payment. Try again or contact your administrator.', 'payme'), 'error');
+        wp_safe_redirect(wc_get_cart_url());
         exit;
     }
 
