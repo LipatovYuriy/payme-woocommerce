@@ -3,7 +3,7 @@
 Plugin Name: Payme
 Plugin URI:  http://paycom.uz
 Description: Payme Checkout Plugin for WooCommerce
-Version: 1.5.2
+Version: 1.5.3
 Author: richman@mail.ru, support@paycom.uz
 Text Domain: payme
 Requires PHP: 7.4
@@ -196,7 +196,7 @@ function woocommerce_payme()
                 $this->merchant_id,
                 $order->get_id(),
                 $sum,
-                $this->get_return_url($order),
+                $this->get_payme_return_url($order),
                 $lang
             );
 
@@ -212,7 +212,7 @@ function woocommerce_payme()
          * used to produce a URL with two '?' characters, which made order_id
          * and key unrecoverable on the receiving end.
          */
-        private function get_return_url(WC_Order $order)
+        private function get_payme_return_url(WC_Order $order)
         {
             return add_query_arg(
                 [
@@ -989,7 +989,7 @@ function payme_success_query_vars($query_vars)
  * since this endpoint previously trusted a plain numeric order_id from the URL.
  *
  * Fixed in 1.5.2: order_id/key are now read from a properly built query
- * string (see get_return_url()) instead of being naively concatenated onto
+ * string (see get_payme_return_url()) instead of being naively concatenated onto
  * a return_url that already had its own "?payme_success=1" query string -
  * that used to produce a URL with two '?' characters, so order_id and key
  * were never actually recoverable here. The static "payme_success=1" marker
