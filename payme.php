@@ -3,7 +3,7 @@
 Plugin Name: Payme
 Plugin URI:  http://paycom.uz
 Description: Payme Checkout Plugin for WooCommerce
-Version: 1.5.3
+Version: 1.6.0
 Author: richman@mail.ru, support@paycom.uz
 Text Domain: payme
 Requires PHP: 7.4
@@ -98,6 +98,8 @@ function woocommerce_payme()
             add_action('woocommerce_receipt_' . $this->id, [$this, 'receipt_page']);
             add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
             add_action('woocommerce_api_wc_' . $this->id, [$this, 'callback']);
+            // Bare, theme-less hand-off endpoint; see redirect_to_payme().
+            add_action('woocommerce_api_wc_' . $this->id . '_redirect', [$this, 'redirect_to_payme']);
         }
 
         public function admin_options()
@@ -182,44 +184,104 @@ function woocommerce_payme()
          *
          * @see https://developer.help.paycom.uz/initsializatsiya-platezhey/otpravka-cheka-po-metodu-get/
          */
-        private function build_payme_checkout_url(WC_Order $order)
+        /**
+         * Builds a minimal HTML page containing the classic Payme POST checkout
+         * form, auto-submitted via JS as soon as the page loads. This POST
+         * method is what supports the 'description' field (shown as
+         * "Описание" in the Paycom merchant cabinet) - Payme's GET "quick
+         * link" method used in 1.5.2/1.5.3 has no equivalent field for it.
+         * The auto-submit keeps the pause the customer sees down to whatever
+         * their browser takes to parse and run a few lines of JS - in
+         * practice indistinguishable from a direct redirect - while still
+         * getting the description through. A visible fallback button and
+         * "Cancel" link are included in case JS is blocked.
+         *
+         * NOTE on the 'callback' URL format and 'callback_timeout': both are
+         * deliberately kept byte-identical to plugin version 1.5.1, which is
+         * the last version where Payme's checkout page rendered its countdown
+         * correctly. Version 1.5.2 switched this URL to add_query_arg(), which
+         * is more correct per URL standards but introduces '&' characters -
+         * and empirically Payme's own front-end then fails to substitute its
+         * "{{ timeout }}" placeholder (the countdown never appears and the
+         * auto-return never fires) until the customer manually refreshes.
+         * Tested with callback_timeout set to 15, 1000, 15000 and omitted
+         * entirely: the deciding factor is the '&' in the callback URL, not
+         * the timeout value. So: do NOT "clean this up" with add_query_arg()
+         * and do not add extra query parameters to the return URL - keep it
+         * free of '&'. get_payme_return_url() below builds it, and
+         * payme_parse_return_params() parses it back.
+         */
+        private function generate_payme_form(WC_Order $order)
         {
             $sum = $this->to_tiyin($order->get_total());
+            $description = sprintf(__('Payment for Order #%1$s', 'payme'), $order->get_id());
 
             $lang_codes = ['ru_RU' => 'ru', 'en_US' => 'en', 'uz_UZ' => 'uz'];
             $lang = isset($lang_codes[get_locale()]) ? $lang_codes[get_locale()] : 'en';
 
-            // Params are delimited with ';' - the callback URL itself must
-            // therefore never contain a literal ';' (a normal WP query string doesn't).
-            $params = sprintf(
-                'm=%s;ac.order_id=%s;a=%d;c=%s;l=%s',
-                $this->merchant_id,
-                $order->get_id(),
-                $sum,
-                $this->get_payme_return_url($order),
-                $lang
-            );
+            $callback_url = $this->get_payme_return_url($order);
+            $label_pay = __('Continue to payment', 'payme');
+            $label_cancel = __('Cancel payment and return back', 'payme');
+            $label_redirecting = __('Redirecting to the payment page...', 'payme');
 
-            return trailingslashit($this->checkout_url) . base64_encode($params);
+            // The visible controls live inside <noscript> so that, in the
+            // normal (JS enabled) case, the customer never sees a button or a
+            // message flash by - the form just submits itself. Without JS they
+            // get a working button and a way back instead of a dead end.
+            $form = '<form action="' . esc_url($this->checkout_url) . '" method="POST" id="payme_form">'
+                . '<input type="hidden" name="merchant" value="' . esc_attr($this->merchant_id) . '">'
+                . '<input type="hidden" name="amount" value="' . esc_attr($sum) . '">'
+                . '<input type="hidden" name="account[order_id]" value="' . esc_attr($order->get_id()) . '">'
+                . '<input type="hidden" name="callback" value="' . esc_attr($callback_url) . '">'
+                . '<input type="hidden" name="description" value="' . esc_attr($description) . '">'
+                . '<input type="hidden" name="lang" value="' . esc_attr($lang) . '">'
+                . '<noscript>'
+                . '<p>' . esc_html($label_redirecting) . '</p>'
+                . '<input type="submit" class="button alt" id="submit_payme_form" value="' . esc_attr($label_pay) . '">'
+                . ' <a class="button cancel" href="' . esc_url($order->get_cancel_order_url()) . '">' . esc_html($label_cancel) . '</a>'
+                . '</noscript>'
+                . '</form>'
+                . '<script>document.getElementById("payme_form").submit();</script>';
+
+            return $form;
         }
 
         /**
          * The URL Payme redirects the customer's browser back to after payment
-         * or cancellation. Built with add_query_arg() (not string concatenation)
-         * so order_id/key are always well-formed, separate query parameters -
-         * concatenating them onto a return_url that already has its own "?...”
-         * query string (the default is site_url('/cart/?payme_success=1'))
-         * used to produce a URL with two '?' characters, which made order_id
-         * and key unrecoverable on the receiving end.
+         * or cancellation.
+         *
+         * Format is intentionally the 1.5.1 one: "<return_url>/<id>/?key=<key>".
+         * With the default return_url (site_url('/cart/?payme_success=1')) this
+         * yields a URL whose query string is a single parameter whose value
+         * happens to contain '/' and a second '?':
+         *
+         *   https://site.uz/cart/?payme_success=1/3258/?key=wc_order_xxx
+         *
+         * That is unusual but legal, contains no '&', and - crucially - is the
+         * shape Payme's checkout page actually copes with (see the note on
+         * generate_payme_form() above). payme_parse_return_params() recovers
+         * the order id and key from it.
          */
         private function get_payme_return_url(WC_Order $order)
         {
+            return trailingslashit($this->return_url) . $order->get_id() . '/?key=' . $order->get_order_key();
+        }
+
+        /**
+         * URL of the bare hand-off endpoint (see redirect_to_payme()).
+         * The '&' restriction that applies to the Payme *callback* URL is
+         * irrelevant here: this URL is only ever followed by the customer's
+         * own browser, never parsed by Payme, so add_query_arg() is fine.
+         */
+        private function get_handoff_url(WC_Order $order)
+        {
             return add_query_arg(
                 [
+                    'wc-api' => 'wc_' . $this->id . '_redirect',
                     'order_id' => $order->get_id(),
                     'key' => $order->get_order_key(),
                 ],
-                $this->return_url
+                home_url('/')
             );
         }
 
@@ -234,14 +296,51 @@ function woocommerce_payme()
 
             return [
                 'result' => 'success',
-                'redirect' => $this->build_payme_checkout_url($order)
+                'redirect' => $this->get_handoff_url($order)
             ];
         }
 
         /**
-         * Handles the "Pay for order" retry entry point (My Account > Orders > Pay).
-         * Redirects straight to Payme instead of rendering an intermediate page,
-         * for the same reason and in the same way as process_payment() above.
+         * Bare hand-off page: emits nothing but the Payme POST form and a
+         * one-line auto-submit, with no theme, no header/footer, no styles
+         * and no extra queries. It exists because Payme's payment description
+         * can only be sent via the POST method (the GET "quick link" method
+         * has no field for it), and a POST needs a form in the customer's
+         * browser - but the full WooCommerce "Pay for order" page used for
+         * that until 1.5.9 loads the entire theme, which the customer sees as
+         * a real intermediate page. This document is a few hundred bytes and
+         * submits itself on parse, so in practice it behaves like a plain
+         * redirect. The <noscript> path leaves the customer a working button.
+         */
+        public function redirect_to_payme()
+        {
+            $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
+            $key = isset($_GET['key']) ? sanitize_text_field(wp_unslash($_GET['key'])) : '';
+            $order = $order_id ? wc_get_order($order_id) : false;
+
+            if (!$order || $key === '' || !hash_equals((string) $order->get_order_key(), $key)) {
+                wp_safe_redirect(wc_get_cart_url());
+                exit;
+            }
+
+            if (!headers_sent()) {
+                nocache_headers();
+                header('Content-Type: text/html; charset=utf-8');
+            }
+
+            echo '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                . '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                . '<title>' . esc_html__('Redirecting to the payment page...', 'payme') . '</title>'
+                . '</head><body>'
+                . $this->generate_payme_form($order)
+                . '</body></html>';
+            exit;
+        }
+
+        /**
+         * Renders the auto-submitting Payme form on the "Pay" retry from
+         * My Account > Orders, which necessarily goes through WooCommerce's
+         * own order-pay page. New checkouts skip this via redirect_to_payme().
          */
         public function receipt_page($order_id)
         {
@@ -251,8 +350,7 @@ function woocommerce_payme()
                 return;
             }
 
-            wp_redirect($this->build_payme_checkout_url($order));
-            exit;
+            echo $this->generate_payme_form($order);
         }
 
         /**
@@ -980,6 +1078,63 @@ function payme_success_query_vars($query_vars)
 }
 
 /**
+ * Recovers the order id and order key from Payme's return request.
+ *
+ * The callback URL handed to Payme has no '&' in it (see the notes in the
+ * gateway class - Payme's checkout page misrenders its countdown when the
+ * callback URL contains encoded ampersands), so the two values are not
+ * ordinary separate query parameters. With the default return_url the
+ * browser comes back to:
+ *
+ *   /cart/?payme_success=1/3258/?key=wc_order_xxx
+ *
+ * i.e. a single 'payme_success' parameter whose value carries both. When
+ * return_url has no query string of its own the id lands in the path and
+ * 'key' is a normal parameter. Both shapes are handled here, as is the
+ * 1.5.2-1.5.8 shape with real order_id/key parameters, so that returns for
+ * orders created by those versions still resolve.
+ *
+ * @return array{0:int,1:string} [order_id, order_key]
+ */
+function payme_parse_return_params($wp)
+{
+    $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
+    $key = isset($_GET['key']) ? sanitize_text_field(wp_unslash($_GET['key'])) : '';
+
+    $marker = '';
+    if (isset($wp->query_vars['payme_success'])) {
+        $marker = (string) $wp->query_vars['payme_success'];
+    } elseif (isset($_GET['payme_success'])) {
+        $marker = (string) wp_unslash($_GET['payme_success']);
+    }
+
+    // The marker looks like "<original payme_success value>/<order id>/?key=<key>",
+    // e.g. "1/3258/?key=wc_order_xxx" - so the id is the segment delimited by
+    // slashes, not the leading value of payme_success itself.
+    if (!$order_id && $marker !== '' && preg_match('~/(\d+)/~', $marker, $m)) {
+        $order_id = absint($m[1]);
+    }
+
+    if ($key === '' && $marker !== '' && preg_match('~key=([A-Za-z0-9_\-]+)~', $marker, $m)) {
+        $key = sanitize_text_field($m[1]);
+    }
+
+    // Fall back to the raw request URI if the server or another plugin
+    // normalised the query string on the way in.
+    if ((!$order_id || $key === '') && !empty($_SERVER['REQUEST_URI'])) {
+        $uri = wp_unslash($_SERVER['REQUEST_URI']);
+        if (!$order_id && preg_match('~payme_success=\d+/(\d+)/~', $uri, $m)) {
+            $order_id = absint($m[1]);
+        }
+        if ($key === '' && preg_match('~key=([A-Za-z0-9_\-]+)~', $uri, $m)) {
+            $key = sanitize_text_field($m[1]);
+        }
+    }
+
+    return [$order_id, $key];
+}
+
+/**
  * Handles the buyer-facing return from Payme's checkout.
  *
  * Rewritten in 1.5.0 to stop hooking into the global 'the_title'/'the_content'
@@ -988,13 +1143,9 @@ function payme_success_query_vars($query_vars)
  * status message), and to verify the order key before showing payment status,
  * since this endpoint previously trusted a plain numeric order_id from the URL.
  *
- * Fixed in 1.5.2: order_id/key are now read from a properly built query
- * string (see get_payme_return_url()) instead of being naively concatenated onto
- * a return_url that already had its own "?payme_success=1" query string -
- * that used to produce a URL with two '?' characters, so order_id and key
- * were never actually recoverable here. The static "payme_success=1" marker
- * never varied with the real outcome anyway, so it's dropped in favour of
- * checking the order's real status, which is what actually reflects payment.
+ * The order id and key are extracted by payme_parse_return_params(); see the
+ * notes there and on the gateway's get_payme_return_url() for why the callback
+ * URL deliberately keeps its unusual, ampersand-free shape.
  */
 add_action('parse_request', 'payme_success_parse_request');
 function payme_success_parse_request(&$wp)
@@ -1007,12 +1158,10 @@ function payme_success_parse_request(&$wp)
         return;
     }
 
-    $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
+    list($order_id, $submitted_key) = payme_parse_return_params($wp);
     $order = $order_id ? wc_get_order($order_id) : false;
 
-    $submitted_key = isset($_GET['key']) ? sanitize_text_field(wp_unslash($_GET['key'])) : '';
-
-    if (!$order || !hash_equals((string) $order->get_order_key(), $submitted_key)) {
+    if (!$order || $submitted_key === '' || !hash_equals((string) $order->get_order_key(), $submitted_key)) {
         wc_add_notice(__('An error occurred during payment. Try again or contact your administrator.', 'payme'), 'error');
         wp_safe_redirect(wc_get_cart_url());
         exit;
